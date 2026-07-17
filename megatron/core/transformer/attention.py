@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -82,10 +82,22 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
+# The FA4 version is tracked by the `flash-attn-4` distribution metadata,
+# not `flash_attn.__version__` (which reports the 2.x version) or
+# `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
+# `is_fa_min_version` here.
+_MIN_FA4_VERSION = "4.0.0b20"
 try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _get_dist_version
 
-    HAVE_FA4 = True
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from packaging.version import Version as _Version
+
+    try:
+        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    except PackageNotFoundError:
+        HAVE_FA4 = False
 except ImportError:
     HAVE_FA4 = False
 
@@ -1061,7 +1073,7 @@ class Attention(MegatronModule, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=1,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
                 )
             elif HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
@@ -1183,7 +1195,7 @@ class Attention(MegatronModule, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=1,
+                        num_splits=0 if not self.batch_invariant_mode else 1,
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
@@ -1344,18 +1356,16 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        with qkv_linear_manager as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
                 output_gate=self.config.attention_output_gate,
             )
-        if self.offload_qkv_linear:
-            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-            qkv_output = off_interface.group_commit(
-                qkv_output, name="qkv_linear", forced_released_tensors=[]
-            )
+        # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+        qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -1502,6 +1512,9 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, query, "core_attn"
+        )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -1515,9 +1528,7 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with off_interface(
-                    self.offload_core_attention and self.training, query, "core_attn"
-                ) as query:
+                with core_attn_manager as query:
                     core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
@@ -1554,10 +1565,9 @@ class Attention(MegatronModule, ABC):
                 if is_using_quantization_scales(self.config):
                     core_attn_out[inference_context.padding_slice] = 0.0
 
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[query, key, value]
+            )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -1576,12 +1586,10 @@ class Attention(MegatronModule, ABC):
         # Output. [sq, b, h]
         # =================
         nvtx_range_push(suffix="linear_proj")
-        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
-        if self.offload_attn_proj:
-            output = off_interface.group_commit(
-                output, name="attn_proj", forced_released_tensors=[core_attn_out]
-            )
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
